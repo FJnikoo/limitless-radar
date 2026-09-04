@@ -53,11 +53,20 @@ function getField(value: string | null): Field {
 function decode(value: string) {
   return value
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#34;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&ndash;/gi, "–")
+    .replace(/&mdash;/gi, "—")
+    .replace(/&hellip;/gi, "…")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -119,7 +128,7 @@ export async function GET(request: NextRequest) {
       headlines.push({
         title,
         description:
-          tag(block, "description").replace(/<[^>]+>/g, "") || title,
+  decode(tag(block, "description").replace(/<[^>]+>/g, "")) || title,
         link: tag(block, "link"),
         source,
         credibility: credibility(source),
