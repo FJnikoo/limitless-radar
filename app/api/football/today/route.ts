@@ -5,9 +5,14 @@ export const dynamic = "force-dynamic";
 
 type FootballFixture = {
   fixture?: {
-    id?: number;
-    date?: string;
-    venue?: {
+  id?: number;
+  date?: string;
+  status?: {
+    short?: string;
+    long?: string;
+    elapsed?: number | null;
+  };
+  venue?: {
       name?: string | null;
       city?: string | null;
     };
@@ -435,7 +440,38 @@ async function fetchLimitlessSportsMarkets() {
 
   return markets;
 }
+const FINISHED_OR_UNAVAILABLE_STATUSES = new Set([
+  "FT",
+  "AET",
+  "PEN",
+  "CANC",
+  "PST",
+  "ABD",
+  "AWD",
+  "WO",
+]);
 
+function fixtureIsVisible(fixture: FootballFixture) {
+  const status = String(fixture.fixture?.status?.short ?? "")
+    .trim()
+    .toUpperCase();
+
+  if (FINISHED_OR_UNAVAILABLE_STATUSES.has(status)) {
+    return false;
+  }
+
+  const kickoff = fixture.fixture?.date
+    ? new Date(fixture.fixture.date).getTime()
+    : Number.NaN;
+
+  // If API status is absent, hide fixtures whose kickoff was over six hours ago.
+  // This is only a safety fallback; API-Football status remains authoritative.
+  if (Number.isFinite(kickoff) && kickoff < Date.now() - 6 * 60 * 60 * 1000) {
+    return false;
+  }
+
+  return true;
+}
 function buildTodayGame(
   fixture: FootballFixture,
   markets: LimitlessMarket[],
@@ -508,8 +544,9 @@ export async function GET(request: NextRequest) {
     ]);
 
     const games = fixtures
-      .filter((fixture) => ALLOWED_LEAGUES.has(fixture.league?.id ?? -1))
-      .map((fixture) => buildTodayGame(fixture, limitlessMarkets))
+  .filter((fixture) => ALLOWED_LEAGUES.has(fixture.league?.id ?? -1))
+  .filter(fixtureIsVisible)
+  .map((fixture) => buildTodayGame(fixture, limitlessMarkets))
       .filter((game): game is TodayGame => game !== null)
       .sort((a, b) => {
         if (b.marketVolume !== a.marketVolume) {
