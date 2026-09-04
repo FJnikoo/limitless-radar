@@ -499,6 +499,7 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     async function loadData() {
       setAnalysisLoading(true);
@@ -507,6 +508,10 @@ export default function Home() {
       setAnalysisError("");
       setMarketError("");
       setGameDetailError("");
+      setItems([]);
+      setLiveMarkets([]);
+      setGameMarkets([]);
+      setTodayFootballGames([]);
       setFootballResearch(null);
       setFootballAiAnalysis(null);
       setFootballAiProvider("");
@@ -524,17 +529,23 @@ export default function Home() {
       const fieldParam = encodeURIComponent(field);
 
       const analysisRequest = fetch(
-        `/api/ai/analyze?field=${fieldParam}`,
+         `/api/ai/analyze?field=${fieldParam}`,
+          { signal: controller.signal },
       );
       const marketRequest = fetch(
         `/api/markets/active?field=${fieldParam}&limit=5`,
+        { signal: controller.signal },
       );
       const gamesRequest =
-        field === "Sports"
-          ? fetch("/api/football/today")
-          : field === "Esports"
-            ? fetch("/api/markets/active?field=Esports&limit=5&matchOnly=true")
-            : Promise.resolve(null);
+  field === "Sports"
+    ? fetch("/api/football/today", {
+        signal: controller.signal,
+      })
+    : field === "Esports"
+      ? fetch("/api/markets/active?field=Esports&limit=5&matchOnly=true", {
+          signal: controller.signal,
+        })
+      : Promise.resolve(null);
 
       const [analysisResult, marketResult, gamesResult] =
         await Promise.allSettled([
@@ -668,8 +679,9 @@ export default function Home() {
     });
 
     return () => {
-      cancelled = true;
-    };
+  cancelled = true;
+  controller.abort();
+};
   }, [field, isSport]);
 
   function closeGameModal() {
