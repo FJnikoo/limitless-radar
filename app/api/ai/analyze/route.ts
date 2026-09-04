@@ -1,3 +1,4 @@
+import { unstable_cache } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
@@ -77,6 +78,14 @@ const ANALYSIS_CACHE_MS: Record<Field, number> = {
   "World Events": 15 * 60 * 1000,
   Sports: 10 * 60 * 1000,
   Esports: 10 * 60 * 1000,
+};
+const ANALYSIS_REVALIDATE_SECONDS: Record<Field, number> = {
+  Crypto: 15 * 60,
+  Finance: 15 * 60,
+  Politics: 15 * 60,
+  "World Events": 15 * 60,
+  Sports: 10 * 60,
+  Esports: 10 * 60,
 };
 
 const STOP = new Set([
