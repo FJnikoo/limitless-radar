@@ -808,14 +808,26 @@ export default function Home() {
                     </span>
                   </div>
 
-                  <div className="mt-3 rounded-r-md border-l-4 border-[#c6ff00] bg-[#0e1010] px-3 py-2 text-sm">
-                    <strong className="text-[#c6ff00]">May affect:</strong>{" "}
-                    {item.analysis.marketTitle}
-                    <br />
-                    <span className="text-xs text-[#a1a49e]">
-                      Potential market effect: {item.analysis.impact}
-                    </span>
-                  </div>
+                  {item.analysis.marketSlug ? (
+  <div className="mt-3 rounded-r-md border-l-4 border-[#c6ff00] bg-[#0e1010] px-3 py-2 text-sm">
+    <strong className="text-[#c6ff00]">Directly relevant market:</strong>{" "}
+    {item.analysis.marketTitle}
+    <br />
+    <span className="text-xs text-[#a1a49e]">
+      Potential market effect: {item.analysis.impact}
+    </span>
+  </div>
+) : (
+  <div className="mt-3 rounded-r-md border-l-4 border-[#6b7280] bg-[#111314] px-3 py-2 text-sm">
+    <strong className="text-[#d0d4cc]">
+      No directly relevant active Limitless market found.
+    </strong>
+    <br />
+    <span className="text-xs text-[#a1a49e]">
+      This headline is provided as background research only.
+    </span>
+  </div>
+)}
 
                   <button
                     onClick={() => setSelectedItem(item)}

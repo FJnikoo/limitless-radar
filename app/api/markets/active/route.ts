@@ -361,6 +361,31 @@ function toCard(market: LimitlessMarket) {
     no: Math.max(0, 1 - yes),
     volume: String(market.volumeFormatted ?? market.volume ?? "0"),
     expirationDate: market.expirationDate ?? "",
+        categories: Array.isArray(market.categories)
+      ? market.categories
+          .map((item) =>
+            typeof item === "string"
+              ? item
+              : String((item as { name?: unknown })?.name ?? ""),
+          )
+          .filter(Boolean)
+      : [],
+    tags: Array.isArray(market.tags)
+      ? market.tags
+          .map((item) =>
+            typeof item === "string"
+              ? item
+              : String((item as { name?: unknown })?.name ?? ""),
+          )
+          .filter(Boolean)
+      : [],
+    properties: (market.properties ?? [])
+      .map(
+        (item) =>
+          `${item.propertyKeySlug ?? ""} ${String(item.value ?? "")}`,
+      )
+      .filter(Boolean),
+    automationType: market.automationType ?? "",
     outcomes: outcomesOf(market),
     url: market.slug
       ? `https://limitless.exchange/markets/${market.slug}`
