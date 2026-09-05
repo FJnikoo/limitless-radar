@@ -1,6 +1,5 @@
-import { unstable_cache } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
-
+import { aiRateLimit, clientIp, redis } from "@/lib/redis";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -31,6 +30,12 @@ type Market = {
   no: number;
   volume: string;
   url: string;
+  categories?: string[];
+  tags?: string[];
+  properties?: string[];
+  automationType?: string;
+  expirationDate?: string;
+  outcomes?: Array<{ name: string }>;
 };
 
 type ModelAnalysis = {
@@ -43,23 +48,18 @@ type ModelAnalysis = {
   analysis: string;
 };
 
-type MatchScore = {
-  score: number;
-  sharedEntities: string[];
-  sharedKeywords: string[];
-};
-type CachedAnalysisResponse = {
-  value: {
-    field: Field;
-    updatedAt: string;
-    provider: string;
-    items: Array<{
-      headline: Headline;
-      analysis: ModelAnalysis;
-    }>;
-  };
-  expiresAt: number;
-};
+
+type MarketTopic =
+  | "price"
+  | "reserve-policy"
+  | "regulation"
+  | "etf"
+  | "macro"
+  | "match"
+  | "election"
+  | "war-conflict"
+  | "corporate"
+  | "other";
 
 const FIELDS: Field[] = [
   "Crypto",
@@ -69,7 +69,7 @@ const FIELDS: Field[] = [
   "Finance",
   "World Events",
 ];
-const analysisResponseCache = new Map<string, CachedAnalysisResponse>();
+
 
 const ANALYSIS_CACHE_MS: Record<Field, number> = {
   Crypto: 15 * 60 * 1000,
@@ -78,14 +78,6 @@ const ANALYSIS_CACHE_MS: Record<Field, number> = {
   "World Events": 15 * 60 * 1000,
   Sports: 10 * 60 * 1000,
   Esports: 10 * 60 * 1000,
-};
-const ANALYSIS_REVALIDATE_SECONDS: Record<Field, number> = {
-  Crypto: 15 * 60,
-  Finance: 15 * 60,
-  Politics: 15 * 60,
-  "World Events": 15 * 60,
-  Sports: 10 * 60,
-  Esports: 10 * 60,
 };
 
 const STOP = new Set([
@@ -127,7 +119,6 @@ const STOP = new Set([
   "new",
   "more",
   "than",
-  "than",
   "how",
   "why",
   "who",
@@ -161,11 +152,6 @@ const GENERIC_TERMS = new Set([
   "prices",
   "trade",
   "trading",
-  "launch",
-  "launches",
-  "launched",
-  "project",
-  "projects",
   "news",
   "update",
   "updates",
@@ -261,24 +247,15 @@ const ENTITY_ALIASES: Record<string, string[]> = {
   "manchester city": ["manchester city", "man city"],
   "manchester united": ["manchester united", "man united", "man utd"],
   "real madrid": ["real madrid"],
-  "barcelona": ["barcelona", "fc barcelona"],
+  barcelona: ["barcelona", "fc barcelona"],
   "team falcons": ["team falcons", "falcons"],
-  "g2": ["g2", "g2 esports"],
+  g2: ["g2", "g2 esports"],
   furia: ["furia"],
   vitality: ["vitality", "team vitality"],
   "kt rolster": ["kt rolster", "kt"],
   "dplus kia": ["dplus kia", "damwon", "dk"],
 };
 
-function removeExpiredAnalysisCache() {
-  const now = Date.now();
-
-  for (const [key, cached] of analysisResponseCache) {
-    if (cached.expiresAt <= now) {
-      analysisResponseCache.delete(key);
-    }
-  }
-}
 
 function getField(value: string | null): Field {
   return FIELDS.includes(value as Field) ? (value as Field) : "Crypto";
@@ -294,6 +271,13 @@ function normaliseText(value: string) {
     .trim();
 }
 
+function textContainsPhrase(text: string, phrase: string) {
+  const paddedText = ` ${normaliseText(text)} `;
+  const paddedPhrase = ` ${normaliseText(phrase)} `;
+
+  return paddedText.includes(paddedPhrase);
+}
+
 function tokenise(value: string) {
   return normaliseText(value)
     .split(" ")
@@ -303,13 +287,6 @@ function tokenise(value: string) {
         !STOP.has(word) &&
         !GENERIC_TERMS.has(word),
     );
-}
-
-function textContainsPhrase(text: string, phrase: string) {
-  const paddedText = ` ${normaliseText(text)} `;
-  const paddedPhrase = ` ${normaliseText(phrase)} `;
-
-  return paddedText.includes(paddedPhrase);
 }
 
 function extractEntities(text: string) {
@@ -324,139 +301,219 @@ function extractEntities(text: string) {
   return [...found];
 }
 
-function keywordSet(text: string) {
-  return new Set(tokenise(text));
-}
-
-function titleText(headline: Headline) {
-  return `${headline.title} ${headline.description}`;
-}
-
 function sharedValues(first: Set<string>, second: Set<string>) {
   return [...first].filter((value) => second.has(value));
 }
 
-function scoreMarketMatch(
-  headline: Headline,
-  market: Market,
-): MatchScore {
-  const headlineText = titleText(headline);
-  const marketText = market.title;
-
-  const headlineEntities = new Set(extractEntities(headlineText));
-  const marketEntities = new Set(extractEntities(marketText));
-  const sharedEntities = sharedValues(headlineEntities, marketEntities);
-
-  const headlineKeywords = keywordSet(headlineText);
-  const marketKeywords = keywordSet(marketText);
-  const sharedKeywords = sharedValues(headlineKeywords, marketKeywords);
-
-  const marketTitleTokens = tokenise(market.title);
-  const marketEntityTokenCount = marketTitleTokens.filter(
-    (token) => !GENERIC_TERMS.has(token),
-  ).length;
-
-  let score = 0;
-
-  // Named entities are much stronger evidence than generic word overlap.
-  score += sharedEntities.length * 8;
-
-  // Two specific shared keywords can support a mapping when aliases are absent.
-  score += Math.min(sharedKeywords.length, 4) * 2;
-
-  // Exact multi-word phrases deserve a small additional boost.
-  for (const entity of sharedEntities) {
-    if (textContainsPhrase(headlineText, entity)) {
-      score += 2;
-    }
-  }
-
-  // A very short/generic market title is unsafe unless an entity matches.
-  if (marketEntityTokenCount < 2 && sharedEntities.length === 0) {
-    score -= 3;
-  }
-
-  return {
-    score,
-    sharedEntities,
-    sharedKeywords,
-  };
+function headlineText(headline: Headline) {
+  return `${headline.title} ${headline.description}`;
 }
 
-function isCleanMarketMatch(
-  headline: Headline,
-  market: Market,
-) {
-  const match = scoreMarketMatch(headline, market);
+function marketText(market: Market) {
+  return [
+    market.title,
+    ...(market.categories ?? []),
+    ...(market.tags ?? []),
+    ...(market.properties ?? []),
+    market.automationType ?? "",
+    ...(market.outcomes ?? []).map((outcome) => outcome.name),
+  ].join(" ");
+}
 
-  // Primary path: a shared named entity is required.
-  if (match.sharedEntities.length >= 1 && match.score >= 8) {
-    return true;
+function topicOf(text: string, field: Field): MarketTopic {
+  const value = normaliseText(text);
+
+  if (
+    /\b(reserve|strategic reserve|national reserve|treasury reserve|bitcoin reserve)\b/.test(
+      value,
+    )
+  ) {
+    return "reserve-policy";
   }
 
-  // Secondary path: when entity aliases do not cover a proper noun,
-  // require three non-generic shared keywords rather than one loose overlap.
   if (
-    match.sharedEntities.length === 0 &&
-    match.sharedKeywords.length >= 3 &&
-    match.score >= 6
+    /\b(sec|regulation|regulator|regulated|law|bill|legislation|congress|executive order|ban|legal|lawsuit)\b/.test(
+      value,
+    )
   ) {
-    return true;
+    return "regulation";
+  }
+
+  if (/\b(etf|exchange traded fund|spot etf)\b/.test(value)) {
+    return "etf";
+  }
+
+  if (
+    /\b(nfp|nonfarm|payroll|jobs|employment|unemployment|cpi|inflation|gdp|interest rate|rate cut|rate hike|federal reserve|the fed|fed meeting)\b/.test(
+      value,
+    )
+  ) {
+    return "macro";
+  }
+
+  if (
+    /\b(vs|versus|fixture|match|game|series|best of|bo1|bo2|bo3|bo5)\b/.test(
+      value,
+    )
+  ) {
+    return "match";
+  }
+
+  if (/\b(election|elected|vote|poll|ballot|primary|nominee)\b/.test(value)) {
+    return "election";
+  }
+
+  if (
+    /\b(war|ceasefire|invasion|missile|strike|conflict|sanctions|nato)\b/.test(
+      value,
+    )
+  ) {
+    return "war-conflict";
+  }
+
+  if (
+    /\b(earnings|revenue|profit|shares|stock|company|ceo|merger|acquisition|ipo)\b/.test(
+      value,
+    )
+  ) {
+    return "corporate";
+  }
+
+  if (field === "Crypto") {
+  const hasCryptoAsset =
+    /\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|crypto)\b/.test(value);
+
+  const hasDirectionalMarketLanguage =
+    /\b(up|down|daily|weekly|monthly|close|closing|above|below|over|under|at|price|value|reach|reaches|hit|hits|clears|rally|rebound|rebounds|selloff|surge|falls|drops|gains|losses)\b/.test(
+      value,
+    );
+
+  if (hasCryptoAsset && hasDirectionalMarketLanguage) {
+    return "price";
+  }
+}
+
+  return "other";
+}
+
+function topicsAreCompatible(
+  headlineTopic: MarketTopic,
+  marketTopic: MarketTopic,
+) {
+  if (headlineTopic === "other" || marketTopic === "other") {
+    return false;
+  }
+
+  return headlineTopic === marketTopic;
+}
+
+function hasPriceLanguage(text: string) {
+  return /\b(price|above|below|at|reach|reaches|hit|hits|clears|rally|selloff|surge|falls|drops|value)\b/i.test(
+    text,
+  );
+}
+
+function isCleanMarketMatch(headline: Headline, market: Market, field: Field) {
+  const headlineValue = headlineText(headline);
+  const marketValue = marketText(market);
+
+  const headlineEntities = new Set(extractEntities(headlineValue));
+  const marketEntities = new Set(extractEntities(marketValue));
+  const sharedEntities = sharedValues(headlineEntities, marketEntities);
+
+  const headlineTopic = topicOf(headlineValue, field);
+  const marketTopic = topicOf(marketValue, field);
+
+  const headlineTokens = new Set(tokenise(headlineValue));
+  const marketTokens = new Set(tokenise(marketValue));
+  const sharedKeywords = sharedValues(headlineTokens, marketTokens);
+
+  if (field === "Sports" || field === "Esports") {
+    return (
+      sharedEntities.length >= 2 ||
+      (headlineTopic === "match" &&
+        marketTopic === "match" &&
+        sharedEntities.length >= 1 &&
+        sharedKeywords.length >= 2)
+    );
+  }
+
+  if (field === "Crypto") {
+  // A Crypto mapping needs both the same asset and the same market/event type.
+  // Bitcoin price news can map to BTC daily/price markets, but never to BTC reserve policy.
+  if (sharedEntities.length === 0) {
+    return false;
+  }
+
+  return topicsAreCompatible(headlineTopic, marketTopic);
+}
+
+  if (field === "Finance") {
+    return (
+      sharedEntities.length >= 1 &&
+      topicsAreCompatible(headlineTopic, marketTopic)
+    );
+  }
+
+  if (field === "Politics" || field === "World Events") {
+    return (
+      sharedEntities.length >= 1 &&
+      topicsAreCompatible(headlineTopic, marketTopic)
+    );
   }
 
   return false;
 }
 
-function bestMarket(headline: Headline, markets: Market[]) {
-  const candidates = markets
+function matchScore(headline: Headline, market: Market, field: Field) {
+  const headlineValue = headlineText(headline);
+  const marketValue = marketText(market);
+  const sharedEntities = sharedValues(
+    new Set(extractEntities(headlineValue)),
+    new Set(extractEntities(marketValue)),
+  );
+  const sharedKeywords = sharedValues(
+    new Set(tokenise(headlineValue)),
+    new Set(tokenise(marketValue)),
+  );
+  const topicsMatch = topicsAreCompatible(
+    topicOf(headlineValue, field),
+    topicOf(marketValue, field),
+  );
+
+  return (
+    sharedEntities.length * 20 +
+    Math.min(sharedKeywords.length, 5) * 3 +
+    (topicsMatch ? 20 : 0)
+  );
+}
+
+function bestMarket(headline: Headline, markets: Market[], field: Field) {
+  const matches = markets
+    .filter((market) => isCleanMarketMatch(headline, market, field))
     .map((market) => ({
       market,
-      match: scoreMarketMatch(headline, market),
+      score: matchScore(headline, market, field),
     }))
-    .filter(({ market }) => isCleanMarketMatch(headline, market))
     .sort((a, b) => {
-      if (b.match.score !== a.match.score) {
-        return b.match.score - a.match.score;
-      }
-
+      if (b.score !== a.score) return b.score - a.score;
       return Number(b.market.volume) - Number(a.market.volume);
     });
 
-  return candidates[0]?.market ?? null;
+  return matches[0]?.market ?? null;
 }
 
 function noMappingAnalysis(headlineIndex: number): ModelAnalysis {
   return {
     headlineIndex,
     marketSlug: null,
-    marketTitle: "No clean market mapping",
+    marketTitle: "No directly relevant active Limitless market found",
     impact: "No clean market mapping",
     confidence: 1,
     horizon: "Not applicable",
     analysis:
-      "This headline does not have a sufficiently direct connection to an active Limitless market in the selected field. Use it as background research only.",
+      "This headline does not have a sufficiently direct connection to an active Limitless market in the selected field. It is shown as background research only.",
   };
-}
-
-function fallbackAnalyses(headlines: Headline[], markets: Market[]) {
-  return headlines.map((headline, headlineIndex) => {
-    const market = bestMarket(headline, markets);
-
-    if (!market) {
-      return noMappingAnalysis(headlineIndex);
-    }
-
-    return {
-      headlineIndex,
-      marketSlug: market.slug,
-      marketTitle: market.title,
-      impact: "Mixed / uncertain",
-      confidence: 2,
-      horizon: "Hours to 1 day",
-      analysis:
-        "This headline has a direct topic overlap with the selected active Limitless market. Treat the connection as research context, not a trade recommendation.",
-    };
-  });
 }
 
 function sanitiseAnalysisText(value: unknown) {
@@ -478,7 +535,6 @@ function sanitiseImpact(value: unknown) {
   ]);
 
   const impact = String(value ?? "").trim();
-
   return allowed.has(impact) ? impact : "Mixed / uncertain";
 }
 
@@ -492,7 +548,6 @@ function sanitiseHorizon(value: unknown) {
   ]);
 
   const horizon = String(value ?? "").trim();
-
   return allowed.has(horizon) ? horizon : "Hours to 1 day";
 }
 
@@ -511,6 +566,7 @@ function buildItems(
   headlines: Headline[],
   markets: Market[],
   analyses: ModelAnalysis[],
+  field: Field,
 ) {
   const marketsBySlug = new Map(
     markets.map((market) => [market.slug, market]),
@@ -518,30 +574,27 @@ function buildItems(
 
   return headlines.slice(0, 5).map((headline, headlineIndex) => {
     const modelAnalysis = modelAnalysisForHeadline(headlineIndex, analyses);
-    const proposedMarket =
-      modelAnalysis?.marketSlug
-        ? marketsBySlug.get(modelAnalysis.marketSlug)
-        : null;
+    const proposedMarket = modelAnalysis?.marketSlug
+      ? marketsBySlug.get(modelAnalysis.marketSlug)
+      : null;
 
-    // The backend, not the model, makes the final decision on relevance.
     const market =
-      proposedMarket && isCleanMarketMatch(headline, proposedMarket)
+      proposedMarket &&
+      isCleanMarketMatch(headline, proposedMarket, field)
         ? proposedMarket
-        : bestMarket(headline, markets);
+        : bestMarket(headline, markets, field);
 
     if (!market) {
-      const fallback = noMappingAnalysis(headlineIndex);
-
       return {
         headline,
-        analysis: fallback,
+        analysis: noMappingAnalysis(headlineIndex),
       };
     }
 
     const useModelText =
       proposedMarket?.slug === market.slug &&
       modelAnalysis &&
-      isCleanMarketMatch(headline, market);
+      isCleanMarketMatch(headline, market, field);
 
     return {
       headline,
@@ -585,9 +638,7 @@ function getGeminiText(data: unknown) {
     }>;
   };
 
-  if (!Array.isArray(result.steps)) {
-    return "";
-  }
+  if (!Array.isArray(result.steps)) return "";
 
   return result.steps
     .filter((step) => step.type === "model_output")
@@ -609,9 +660,7 @@ function getGroqText(data: unknown) {
 async function askGemini(prompt: string) {
   const key = process.env.GEMINI_API_KEY;
 
-  if (!key) {
-    throw new Error("Gemini API key is not configured.");
-  }
+  if (!key) throw new Error("Gemini API key is not configured.");
 
   const response = await fetch(
     "https://generativelanguage.googleapis.com/v1beta/interactions",
@@ -635,10 +684,7 @@ async function askGemini(prompt: string) {
   }
 
   const text = getGeminiText(data);
-
-  if (!text) {
-    throw new Error("Gemini returned an empty response.");
-  }
+  if (!text) throw new Error("Gemini returned an empty response.");
 
   return text;
 }
@@ -646,9 +692,7 @@ async function askGemini(prompt: string) {
 async function askGroq(prompt: string) {
   const key = process.env.GROQ_API_KEY;
 
-  if (!key) {
-    throw new Error("Groq API key is not configured.");
-  }
+  if (!key) throw new Error("Groq API key is not configured.");
 
   const response = await fetch(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -668,10 +712,7 @@ async function askGroq(prompt: string) {
             content:
               "You are a careful prediction-market research analyst. Return only valid JSON.",
           },
-          {
-            role: "user",
-            content: prompt,
-          },
+          { role: "user", content: prompt },
         ],
       }),
     },
@@ -684,20 +725,14 @@ async function askGroq(prompt: string) {
   }
 
   const text = getGroqText(data);
-
-  if (!text) {
-    throw new Error("Groq returned an empty response.");
-  }
+  if (!text) throw new Error("Groq returned an empty response.");
 
   return text;
 }
 
 async function askModel(prompt: string) {
   try {
-    return {
-      provider: "Gemini",
-      text: await askGemini(prompt),
-    };
+    return { provider: "Gemini", text: await askGemini(prompt) };
   } catch (geminiError) {
     console.warn("Gemini failed. Trying Groq.", geminiError);
 
@@ -707,12 +742,8 @@ async function askModel(prompt: string) {
         text: await askGroq(prompt),
       };
     } catch (groqError) {
-      console.warn("Groq failed. Using deterministic mapping.", groqError);
-
-      return {
-        provider: "Strict deterministic market match",
-        text: "",
-      };
+      console.warn("Groq failed. Using strict deterministic mapping.", groqError);
+      return { provider: "Strict deterministic market match", text: "" };
     }
   }
 }
@@ -723,24 +754,28 @@ You are an English-language research analyst for Limitless prediction markets.
 
 FIELD: ${field}
 
-Your job is to connect each headline only to an ACTIVE MARKET with a direct and defensible relationship.
+Map each headline only to an ACTIVE MARKET with a direct, specific and defensible relationship.
 
-Strict market-mapping rules:
-- A shared general field is never enough. For example, a Bitcoin headline must not map to an unrelated token-launch market.
-- Prefer the same named entity: asset, company, person, country, team, player, tournament, election, institution, or policy.
-- A direct causal connection is required. If a market is only loosely related, set marketSlug to null.
-- Never invent a market slug. marketSlug must exactly match one from ACTIVE MARKETS or be null.
-- If uncertain, return null. Fewer mappings are better than incorrect mappings.
+Non-negotiable rules:
+- A shared general entity is never enough. Bitcoin price news must NOT map to a Bitcoin reserve-policy market.
+- Match both the named entity and event type. Examples:
+  - Bitcoin price move -> only Bitcoin price-level/direction markets.
+  - Bitcoin reserve policy -> only reserve, government-policy, legislation or executive-order markets.
+  - NFP/CPI/Fed news -> only NFP/CPI/Fed/rates markets.
+  - Sports or Esports news -> only the same fixture, teams, player, or tournament.
+- If no exact active market fits, marketSlug MUST be null.
+- Never invent a slug. Use only a slug in ACTIVE MARKETS.
+- Fewer mappings are better than a weak or misleading mapping.
 - Do not make a prediction or recommend buying, selling, trading, betting, or wagering.
-- Do not use: buy, sell, bet, wager, guaranteed, certain.
+- Return only valid JSON.
 
-Return ONLY valid JSON using exactly this schema:
+Return exactly:
 {
   "analyses": [
     {
       "headlineIndex": 0,
       "marketSlug": "active-market-slug or null",
-      "marketTitle": "active market title or No clean market mapping",
+      "marketTitle": "active market title or No directly relevant active Limitless market found",
       "impact": "Potential YES/UP support | Potential NO/DOWN support | Mixed / uncertain | No clean market mapping",
       "confidence": 1,
       "horizon": "Minutes to hours | Hours to 1 day | Days | Days to weeks | Not applicable",
@@ -766,6 +801,12 @@ ${JSON.stringify(
   markets.map((market) => ({
     slug: market.slug,
     title: market.title,
+    categories: market.categories ?? [],
+    tags: market.tags ?? [],
+    properties: market.properties ?? [],
+    automationType: market.automationType ?? "",
+    expirationDate: market.expirationDate ?? "",
+    outcomes: market.outcomes ?? [],
     yesPrice: market.yes,
     noPrice: market.no,
     volume: market.volume,
@@ -776,19 +817,62 @@ ${JSON.stringify(
 
 export async function GET(request: NextRequest) {
   const field = getField(request.nextUrl.searchParams.get("field"));
-  removeExpiredAnalysisCache();
-
-const cached = analysisResponseCache.get(field);
-
-if (cached && cached.expiresAt > Date.now()) {
-  return NextResponse.json({
-    ...cached.value,
-    cached: true,
-    expiresAt: new Date(cached.expiresAt).toISOString(),
-  });
-}
+  const cacheKey = `limitless-radar:ai-analysis:v1:${field
+    .toLowerCase()
+    .replace(/\s+/g, "-")}`;
+  const ttlSeconds = Math.floor(ANALYSIS_CACHE_MS[field] / 1000);
 
   try {
+    if (redis) {
+      const cached = await redis.get<{
+        field: Field;
+        updatedAt: string;
+        provider: string;
+        items: Array<{
+          headline: Headline;
+          analysis: ModelAnalysis;
+        }>;
+      }>(cacheKey);
+
+      if (cached) {
+        const ttl = await redis.ttl(cacheKey);
+
+        return NextResponse.json({
+          ...cached,
+          cached: true,
+          expiresAt:
+            typeof ttl === "number" && ttl > 0
+              ? new Date(Date.now() + ttl * 1000).toISOString()
+              : null,
+        });
+      }
+    }
+
+    if (aiRateLimit) {
+      const identifier = clientIp(request);
+      const { success, reset } = await aiRateLimit.limit(identifier);
+
+      if (!success) {
+        const retryAfter = Math.max(
+          1,
+          Math.ceil((reset - Date.now()) / 1000),
+        );
+
+        return NextResponse.json(
+          {
+            error: "Too many analysis requests. Please try again shortly.",
+            retryAfter,
+          },
+          {
+            status: 429,
+            headers: {
+              "Retry-After": String(retryAfter),
+            },
+          },
+        );
+      }
+    }
+
     const origin = request.nextUrl.origin;
 
     const [newsResponse, marketsResponse] = await Promise.all([
@@ -797,9 +881,7 @@ if (cached && cached.expiresAt > Date.now()) {
       }),
       fetch(
         `${origin}/api/markets/active?field=${encodeURIComponent(field)}&limit=25`,
-        {
-          cache: "no-store",
-        },
+        { cache: "no-store" },
       ),
     ]);
 
@@ -848,24 +930,21 @@ if (cached && cached.expiresAt > Date.now()) {
     }
 
     const value = {
-  field,
-  updatedAt: new Date().toISOString(),
-  provider: model.provider,
-  items: buildItems(headlines, markets, parsedAnalyses),
-};
+      field,
+      updatedAt: new Date().toISOString(),
+      provider: model.provider,
+      items: buildItems(headlines, markets, parsedAnalyses, field),
+    };
 
-const expiresAt = Date.now() + ANALYSIS_CACHE_MS[field];
+    if (redis) {
+      await redis.set(cacheKey, value, { ex: ttlSeconds });
+    }
 
-analysisResponseCache.set(field, {
-  value,
-  expiresAt,
-});
-
-return NextResponse.json({
-  ...value,
-  cached: false,
-  expiresAt: new Date(expiresAt).toISOString(),
-});
+    return NextResponse.json({
+      ...value,
+      cached: false,
+      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    });
   } catch (error) {
     console.error("Analysis route error:", error);
 
