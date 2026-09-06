@@ -13,8 +13,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Limitless Radar",
+  title: "Limitless Radar — Built by FJ | @FJnikoo",
   description: "Live Limitless market intelligence and news research. Built by FJ.",
+  icons: {
+    icon: "/icon.png",
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
