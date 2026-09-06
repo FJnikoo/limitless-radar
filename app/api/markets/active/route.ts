@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 export const runtime = "nodejs";
 
 type Field =
@@ -67,6 +72,7 @@ type Outcome = {
   volume: string;
   slug: string;
 };
+
 
 const FIELDS: Field[] = [
   "Crypto",
@@ -392,7 +398,114 @@ function toCard(market: LimitlessMarket) {
       : "https://limitless.exchange",
   };
 }
+type ActiveMarketsResponse = {
+  field: Field;
+  matchOnly: boolean;
+  markets: ReturnType<typeof toCard>[];
+};
 
+function activeMarketsCacheTtlMs(
+  field: Field,
+  matchOnly: boolean,
+) {
+  if (matchOnly) {
+    return 2 * 60 * 1000;
+  }
+
+  if (field === "Sports" || field === "Esports") {
+    return 2 * 60 * 1000;
+  }
+
+  return 5 * 60 * 1000;
+}
+
+function activeMarketsResponse(
+  value: ActiveMarketsResponse,
+  options: {
+    cached: boolean;
+    stale: boolean;
+    updatedAt: string | null;
+  },
+) {
+  return NextResponse.json(
+    {
+      ...value,
+      ...options,
+    },
+    {
+      headers: {
+        "Cache-Control": "public, s-maxage=30, stale-while-revalidate=120",
+      },
+    },
+  );
+}
+async function buildActiveMarkets(
+  field: Field,
+  matchOnly: boolean,
+  limit: number,
+): Promise<ActiveMarketsResponse> {
+  const all = (
+    await Promise.all([
+      fetchPages("automationType=lumy", 4),
+      fetchPages("automationType=sports", 10),
+      fetchPages("automationType=manual", 6),
+    ])
+  ).flat();
+
+  const unique = new Map<string, LimitlessMarket>();
+
+  for (const market of all) {
+    const slug = market.slug ?? String(market.id ?? "");
+
+    if (slug) {
+      unique.set(slug, market);
+    }
+  }
+
+  const available = [...unique.values()];
+  let selected: LimitlessMarket[];
+
+  if (matchOnly) {
+    if (field !== "Sports" && field !== "Esports") {
+      return { field, matchOnly, markets: [] };
+    }
+
+    selected = available.filter((market) => isMatchMarket(market, field));
+  } else {
+    selected = available.filter((market) => classify(market) === field);
+
+    if (selected.length < 5 && field === "Finance") {
+      selected = available.filter(
+        (market) =>
+          classify(market) === "Finance" ||
+          (classify(market) === "Crypto" && !CRYPTO.test(marketText(market))),
+      );
+    }
+
+    if (selected.length < 5 && field === "Politics") {
+      selected = available.filter(
+        (market) =>
+          classify(market) === "Politics" ||
+          classify(market) === "World Events",
+      );
+    }
+
+    if (selected.length < 5 && field === "World Events") {
+      selected = available.filter(
+        (market) => classify(market) === "World Events",
+      );
+    }
+  }
+
+  return {
+    field,
+    matchOnly,
+    markets: selected
+      .sort((a, b) => volumeNumber(b) - volumeNumber(a))
+      .slice(0, limit)
+      .map(toCard),
+  };
+}
 export async function GET(request: NextRequest) {
   const field = getField(request.nextUrl.searchParams.get("field"));
   const matchOnly =
@@ -404,68 +517,118 @@ export async function GET(request: NextRequest) {
     Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 5),
   );
 
+  const cacheKey = `limitless-radar:markets-active:v1:${field
+    .toLowerCase()
+    .replace(/\s+/g, "-")}:${matchOnly ? "matches" : "all"}:${limit}`;
+  const lockKey = `${cacheKey}:refresh-lock`;
+  const freshForMs = activeMarketsCacheTtlMs(field, matchOnly);
+  const staleForMs = 60 * 60 * 1000;
+
+  const cached = await readFootballCache<ActiveMarketsResponse>(cacheKey);
+
+  if (cached.status === "fresh") {
+    return activeMarketsResponse(cached.value.value, {
+      cached: true,
+      stale: false,
+      updatedAt: cached.value.updatedAt,
+    });
+  }
+
+  if (cached.status === "stale") {
+    const locked = await acquireFootballRefreshLock(lockKey, 30);
+
+    if (!locked) {
+      return activeMarketsResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    }
+
+    try {
+      const value = await buildActiveMarkets(field, matchOnly, limit);
+
+      const saved = await writeFootballCache(
+        cacheKey,
+        value,
+        freshForMs,
+        staleForMs,
+      );
+
+      return activeMarketsResponse(value, {
+        cached: false,
+        stale: false,
+        updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "Active markets refresh failed; serving stale cache:",
+        error,
+      );
+
+      return activeMarketsResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
+  }
+
+  const locked = await acquireFootballRefreshLock(lockKey, 30);
+
+  if (!locked) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    const retryCache = await readFootballCache<ActiveMarketsResponse>(cacheKey);
+
+    if (retryCache.status === "fresh" || retryCache.status === "stale") {
+      return activeMarketsResponse(retryCache.value.value, {
+        cached: true,
+        stale: retryCache.status === "stale",
+        updatedAt: retryCache.value.updatedAt,
+      });
+    }
+
+    return NextResponse.json(
+      {
+        field,
+        matchOnly,
+        markets: [],
+        cached: true,
+        stale: true,
+        updatedAt: null,
+        message: "Markets are being prepared. Please try again shortly.",
+      },
+      {
+        status: 202,
+        headers: {
+          "Retry-After": "2",
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
+
   try {
-    const all = (
-      await Promise.all([
-        fetchPages("automationType=lumy", 4),
-        fetchPages("automationType=sports", 10),
-        fetchPages("automationType=manual", 6),
-      ])
-    ).flat();
+    const value = await buildActiveMarkets(field, matchOnly, limit);
 
-    const unique = new Map<string, LimitlessMarket>();
+    const saved = await writeFootballCache(
+      cacheKey,
+      value,
+      freshForMs,
+      staleForMs,
+    );
 
-    for (const market of all) {
-      const slug = market.slug ?? String(market.id ?? "");
-      if (slug) unique.set(slug, market);
-    }
-
-    const available = [...unique.values()];
-    let selected: LimitlessMarket[];
-
-    if (matchOnly) {
-      if (field !== "Sports" && field !== "Esports") {
-        return NextResponse.json({ field, matchOnly, markets: [] });
-      }
-
-      selected = available.filter((market) => isMatchMarket(market, field));
-    } else {
-      selected = available.filter((market) => classify(market) === field);
-
-      if (selected.length < 5 && field === "Finance") {
-        selected = available.filter(
-          (market) =>
-            classify(market) === "Finance" ||
-            (classify(market) === "Crypto" && !CRYPTO.test(marketText(market))),
-        );
-      }
-
-      if (selected.length < 5 && field === "Politics") {
-        selected = available.filter(
-          (market) =>
-            classify(market) === "Politics" ||
-            classify(market) === "World Events",
-        );
-      }
-
-      if (selected.length < 5 && field === "World Events") {
-        selected = available.filter(
-          (market) => classify(market) === "World Events",
-        );
-      }
-    }
-
-    const markets = selected
-      .sort((a, b) => volumeNumber(b) - volumeNumber(a))
-      .slice(0, limit)
-      .map(toCard);
-
-    return NextResponse.json({
-      field,
-      matchOnly,
-      markets,
+    return activeMarketsResponse(value, {
+      cached: false,
+      stale: false,
+      updatedAt: saved?.updatedAt ?? new Date().toISOString(),
     });
   } catch (error) {
+    console.error("Active markets route error:", error);
+
     return NextResponse.json(
       {
         error:
@@ -475,5 +638,7 @@ export async function GET(request: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    await releaseFootballRefreshLock(lockKey);
   }
 }

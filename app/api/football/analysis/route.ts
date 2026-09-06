@@ -1,4 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -56,14 +62,49 @@ type FootballAnalysis = {
 };
 
 type CachedAnalysis = {
-  value: FootballAnalysis;
+  analysis: FootballAnalysis;
   provider: string;
   generatedAt: string;
-  expiresAt: number;
+  expiresAt: string;
 };
 
 const analysisCache = new Map<string, CachedAnalysis>();
 const FALLBACK_PROVIDER = "Deterministic Limitless summary";
+function analysisResponse(
+  cached: CachedAnalysis,
+  options: {
+    cached: boolean;
+    stale: boolean;
+  },
+) {
+  return NextResponse.json(
+    {
+      analysis: cached.analysis,
+      provider: cached.provider,
+      cached: options.cached,
+      stale: options.stale,
+      generatedAt: cached.generatedAt,
+      expiresAt: cached.expiresAt,
+    },
+    {
+      headers: {
+        "Cache-Control": "private, max-age=60, stale-while-revalidate=300",
+      },
+    },
+  );
+}
+
+function isLiveStatus(status: string | null) {
+  const value = String(status ?? "").toLowerCase();
+
+  return (
+    value.includes("live") ||
+    value.includes("in play") ||
+    value.includes("first half") ||
+    value.includes("second half") ||
+    value.includes("halftime")
+  );
+}
 
 function cleanJson(text: string) {
   return text
@@ -479,7 +520,7 @@ function removeExpiredCache() {
   const now = Date.now();
 
   for (const [key, item] of analysisCache) {
-    if (item.expiresAt <= now) {
+    if (new Date(item.expiresAt).getTime() <= now) {
       analysisCache.delete(key);
     }
   }
@@ -507,57 +548,157 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    removeExpiredCache();
+        removeExpiredCache();
 
     const key = cacheKey(outcomes, research);
-    const cached = analysisCache.get(key);
+    const redisKey = `limitless-radar:football:analysis:v1:${key}`;
+    const lockKey = `${redisKey}:refresh-lock`;
+    const freshForMs = cacheTtlMs(research.status);
+    const staleForMs = 6 * 60 * 60 * 1000;
 
-    if (cached && cached.expiresAt > Date.now()) {
-      return NextResponse.json({
-        analysis: cached.value,
-        provider: cached.provider,
+    const memoryCached = analysisCache.get(key);
+
+    if (memoryCached && new Date(memoryCached.expiresAt).getTime() > Date.now()) {
+      return analysisResponse(memoryCached, {
         cached: true,
-        generatedAt: cached.generatedAt,
-        expiresAt: new Date(cached.expiresAt).toISOString(),
+        stale: false,
       });
     }
 
-    const prompt = buildAnalysisPrompt(outcomes, research);
-    const model = await askModel(prompt);
+    const redisCached = await readFootballCache<CachedAnalysis>(redisKey);
 
-    let analysis: FootballAnalysis | null = null;
-    let provider = model.provider;
+    if (redisCached.status === "fresh") {
+      analysisCache.set(key, redisCached.value.value);
 
-    if (model.text) {
+      return analysisResponse(redisCached.value.value, {
+        cached: true,
+        stale: false,
+      });
+    }
+
+    if (redisCached.status === "stale") {
+      const gotRefreshLock = await acquireFootballRefreshLock(lockKey, 60);
+
+      if (!gotRefreshLock) {
+        return analysisResponse(redisCached.value.value, {
+          cached: true,
+          stale: true,
+        });
+      }
+
       try {
-        analysis = normaliseAnalysis(JSON.parse(cleanJson(model.text)));
-      } catch {
-        analysis = null;
+        const prompt = buildAnalysisPrompt(outcomes, research);
+        const model = await askModel(prompt);
+
+        let analysis: FootballAnalysis | null = null;
+        let provider = model.provider;
+
+        if (model.text) {
+          try {
+            analysis = normaliseAnalysis(JSON.parse(cleanJson(model.text)));
+          } catch {
+            analysis = null;
+          }
+        }
+
+        if (!analysis) {
+          analysis = fallbackAnalysis(outcomes, research);
+          provider = FALLBACK_PROVIDER;
+        }
+
+        const generatedAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + freshForMs).toISOString();
+
+        const nextCached: CachedAnalysis = {
+          analysis,
+          provider,
+          generatedAt,
+          expiresAt,
+        };
+
+        analysisCache.set(key, nextCached);
+        await writeFootballCache(redisKey, nextCached, freshForMs, staleForMs);
+
+        return analysisResponse(nextCached, {
+          cached: false,
+          stale: false,
+        });
+      } catch (error) {
+        console.error("Football analysis refresh failed; serving stale cache.", error);
+
+        return analysisResponse(redisCached.value.value, {
+          cached: true,
+          stale: true,
+        });
+      } finally {
+        await releaseFootballRefreshLock(lockKey);
       }
     }
 
-    if (!analysis) {
-      analysis = fallbackAnalysis(outcomes, research);
-      provider = FALLBACK_PROVIDER;
+    const gotRefreshLock = await acquireFootballRefreshLock(lockKey, 60);
+
+    if (!gotRefreshLock) {
+      if (memoryCached) {
+        return analysisResponse(memoryCached, {
+          cached: true,
+          stale: true,
+        });
+      }
+
+      return NextResponse.json(
+        {
+          error:
+            "Football analysis is being prepared. Please try again in a few seconds.",
+        },
+        {
+          status: 202,
+          headers: {
+            "Retry-After": "3",
+          },
+        },
+      );
     }
 
-    const generatedAt = new Date().toISOString();
-    const expiresAt = Date.now() + cacheTtlMs(research.status);
+    try {
+      const prompt = buildAnalysisPrompt(outcomes, research);
+      const model = await askModel(prompt);
 
-    analysisCache.set(key, {
-      value: analysis,
-      provider,
-      generatedAt,
-      expiresAt,
-    });
+      let analysis: FootballAnalysis | null = null;
+      let provider = model.provider;
 
-    return NextResponse.json({
-      analysis,
-      provider,
-      cached: false,
-      generatedAt,
-      expiresAt: new Date(expiresAt).toISOString(),
-    });
+      if (model.text) {
+        try {
+          analysis = normaliseAnalysis(JSON.parse(cleanJson(model.text)));
+        } catch {
+          analysis = null;
+        }
+      }
+
+      if (!analysis) {
+        analysis = fallbackAnalysis(outcomes, research);
+        provider = FALLBACK_PROVIDER;
+      }
+
+      const generatedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + freshForMs).toISOString();
+
+      const nextCached: CachedAnalysis = {
+        analysis,
+        provider,
+        generatedAt,
+        expiresAt,
+      };
+
+      analysisCache.set(key, nextCached);
+      await writeFootballCache(redisKey, nextCached, freshForMs, staleForMs);
+
+      return analysisResponse(nextCached, {
+        cached: false,
+        stale: false,
+      });
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
   } catch (error) {
     console.error("Football analysis route error:", error);
 

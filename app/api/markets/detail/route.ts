@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -84,6 +89,18 @@ type FootballResearch = {
   source: "Limitless sports event";
 };
 
+type MarketDetailResponse = {
+  slug: string;
+  title: string;
+  isFixture: boolean;
+  outcomes: Outcome[];
+  volume: string;
+  marketTime: string | null;
+  url: string;
+  source: string;
+  footballResearch: FootballResearch | null;
+};
+
 type LimitlessFootballMatch = {
   fixtureId?: number | string | null;
   dateUtc?: string | null;
@@ -156,6 +173,32 @@ const footballEventCache = new Map<
 
 const MARKET_CACHE_MS = 30 * 1000;
 const FOOTBALL_EVENT_CACHE_MS = 2 * 60 * 1000;
+function marketDetailCacheTtlMs(sportType: string | null | undefined) {
+  return sportType === "football"
+    ? 2 * 60 * 1000
+    : 60 * 1000;
+}
+
+function marketDetailResponse(
+  value: MarketDetailResponse,
+  options: {
+    cached: boolean;
+    stale: boolean;
+    updatedAt: string | null;
+  },
+) {
+  return NextResponse.json(
+    {
+      ...value,
+      ...options,
+    },
+    {
+      headers: {
+        "Cache-Control": "public, s-maxage=30, stale-while-revalidate=120",
+      },
+    },
+  );
+}
 
 function numberValue(value: unknown) {
   const number = Number(value);
@@ -598,6 +641,149 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const cacheKey = `limitless-radar:market-detail:v1:${slug}:${
+    sportType ?? "none"
+  }:${eventId ?? "none"}`;
+  const lockKey = `${cacheKey}:refresh-lock`;
+  const freshForMs = marketDetailCacheTtlMs(sportType);
+  const staleForMs = 60 * 60 * 1000;
+
+  const cached = await readFootballCache<MarketDetailResponse>(cacheKey);
+
+  if (cached.status === "fresh") {
+    return marketDetailResponse(cached.value.value, {
+      cached: true,
+      stale: false,
+      updatedAt: cached.value.updatedAt,
+    });
+  }
+
+  if (cached.status === "stale") {
+    const locked = await acquireFootballRefreshLock(lockKey, 20);
+
+    if (!locked) {
+      return marketDetailResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    }
+
+    try {
+      removeExpiredCache();
+
+      const marketPromise = fetchMarketBySlug(slug);
+      const footballEventPromise =
+        sportType === "football" && eventId
+          ? fetchFootballEvent(eventId).catch(() => null)
+          : Promise.resolve(null);
+
+      const [market, footballEvent] = await Promise.all([
+        marketPromise,
+        footballEventPromise,
+      ]);
+
+      let outcomes = outcomeList(market);
+      let source = "Limitless market detail";
+
+      if (outcomes.length === 0) {
+        const parent = await resolveParentMarket(market);
+
+        if (parent) {
+          const parentOutcomes = outcomeList(parent);
+
+          if (parentOutcomes.length > 0) {
+            outcomes = parentOutcomes;
+            source = "Limitless parent/group detail";
+          }
+        }
+      }
+
+      const title = candidateName(market) || "Untitled market";
+
+      if (outcomes.length === 0 && isFixtureTitle(title)) {
+        outcomes = binaryFixtureOutcomes(market);
+
+        if (outcomes.length > 0) {
+          source = "Limitless binary fixture market";
+        }
+      }
+
+      const value: MarketDetailResponse = {
+        slug,
+        title,
+        isFixture: isFixtureTitle(title),
+        outcomes,
+        volume: String(market.volumeFormatted ?? market.volume ?? "0"),
+        marketTime:
+          market.startDate ??
+          market.startTime ??
+          market.endDate ??
+          market.expirationDate ??
+          null,
+        url: `https://limitless.exchange/markets/${slug}`,
+        source,
+        footballResearch: footballEvent
+          ? extractFootballResearch(footballEvent)
+          : null,
+      };
+
+      const saved = await writeFootballCache(
+        cacheKey,
+        value,
+        freshForMs,
+        staleForMs,
+      );
+
+      return marketDetailResponse(value, {
+        cached: false,
+        stale: false,
+        updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "Limitless market detail refresh failed; serving stale cache:",
+        error,
+      );
+
+      return marketDetailResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
+  }
+
+  const locked = await acquireFootballRefreshLock(lockKey, 20);
+
+  if (!locked) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    const retryCache = await readFootballCache<MarketDetailResponse>(cacheKey);
+
+    if (retryCache.status === "fresh" || retryCache.status === "stale") {
+      return marketDetailResponse(retryCache.value.value, {
+        cached: true,
+        stale: retryCache.status === "stale",
+        updatedAt: retryCache.value.updatedAt,
+      });
+    }
+
+    return NextResponse.json(
+      {
+        error: "Market details are being prepared. Please try again shortly.",
+      },
+      {
+        status: 202,
+        headers: {
+          "Retry-After": "2",
+        },
+      },
+    );
+  }
+
   try {
     removeExpiredCache();
 
@@ -638,7 +824,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.json({
+    const value: MarketDetailResponse = {
       slug,
       title,
       isFixture: isFixtureTitle(title),
@@ -655,6 +841,19 @@ export async function GET(request: NextRequest) {
       footballResearch: footballEvent
         ? extractFootballResearch(footballEvent)
         : null,
+    };
+
+    const saved = await writeFootballCache(
+      cacheKey,
+      value,
+      freshForMs,
+      staleForMs,
+    );
+
+    return marketDetailResponse(value, {
+      cached: false,
+      stale: false,
+      updatedAt: saved?.updatedAt ?? new Date().toISOString(),
     });
   } catch (error) {
     console.error("Limitless market detail route error:", error);
@@ -668,5 +867,7 @@ export async function GET(request: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    await releaseFootballRefreshLock(lockKey);
   }
 }

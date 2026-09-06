@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { aiRateLimit, clientIp, redis } from "@/lib/redis";
+import { aiRateLimit, clientIp } from "@/lib/redis";
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -47,7 +53,14 @@ type ModelAnalysis = {
   horizon: string;
   analysis: string;
 };
-
+type AnalysisResponse = {
+  field: Field;
+  provider: string;
+  items: Array<{
+    headline: Headline;
+    analysis: ModelAnalysis;
+  }>;
+};
 
 type MarketTopic =
   | "price"
@@ -79,6 +92,26 @@ const ANALYSIS_CACHE_MS: Record<Field, number> = {
   Sports: 10 * 60 * 1000,
   Esports: 10 * 60 * 1000,
 };
+function analysisResponse(
+  value: AnalysisResponse,
+  options: {
+    cached: boolean;
+    stale: boolean;
+    updatedAt: string | null;
+  },
+) {
+  return NextResponse.json(
+    {
+      ...value,
+      ...options,
+    },
+    {
+      headers: {
+        "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+      },
+    },
+  );
+}
 
 const STOP = new Set([
   "this",
@@ -814,40 +847,160 @@ ${JSON.stringify(
 )}
 `;
 }
+async function buildAnalysis(
+  request: NextRequest,
+  field: Field,
+): Promise<AnalysisResponse> {
+  const origin = request.nextUrl.origin;
+
+  const [newsResponse, marketsResponse] = await Promise.all([
+    fetch(`${origin}/api/news/latest?field=${encodeURIComponent(field)}`, {
+      cache: "no-store",
+    }),
+    fetch(
+      `${origin}/api/markets/active?field=${encodeURIComponent(field)}&limit=25`,
+      { cache: "no-store" },
+    ),
+  ]);
+
+  if (!newsResponse.ok || !marketsResponse.ok) {
+    throw new Error("News or Limitless markets could not be loaded.");
+  }
+
+  const newsData = await newsResponse.json();
+  const marketData = await marketsResponse.json();
+
+  const headlines: Headline[] = Array.isArray(newsData.headlines)
+    ? newsData.headlines.slice(0, 8)
+    : [];
+
+  const markets: Market[] = Array.isArray(marketData.markets)
+    ? marketData.markets
+    : [];
+
+  if (headlines.length === 0) {
+    throw new Error("No live headlines are available.");
+  }
+
+  const prompt = buildPrompt(field, headlines, markets);
+  const model = await askModel(prompt);
+
+  let parsedAnalyses: ModelAnalysis[] = [];
+
+  if (model.text) {
+    try {
+      const parsed = JSON.parse(cleanJson(model.text)) as {
+        analyses?: unknown;
+      };
+
+      parsedAnalyses = Array.isArray(parsed.analyses)
+        ? (parsed.analyses as ModelAnalysis[])
+        : [];
+    } catch {
+      parsedAnalyses = [];
+    }
+  }
+
+  return {
+    field,
+    provider: model.provider,
+    items: buildItems(headlines, markets, parsedAnalyses, field),
+  };
+}
 
 export async function GET(request: NextRequest) {
   const field = getField(request.nextUrl.searchParams.get("field"));
-  const cacheKey = `limitless-radar:ai-analysis:v1:${field
+  const cacheKey = `limitless-radar:ai-analysis:v2:${field
     .toLowerCase()
     .replace(/\s+/g, "-")}`;
-  const ttlSeconds = Math.floor(ANALYSIS_CACHE_MS[field] / 1000);
+  const lockKey = `${cacheKey}:refresh-lock`;
+  const freshForMs = ANALYSIS_CACHE_MS[field];
+  const staleForMs = 6 * 60 * 60 * 1000;
 
-  try {
-    if (redis) {
-      const cached = await redis.get<{
-        field: Field;
-        updatedAt: string;
-        provider: string;
-        items: Array<{
-          headline: Headline;
-          analysis: ModelAnalysis;
-        }>;
-      }>(cacheKey);
+  const cached = await readFootballCache<AnalysisResponse>(cacheKey);
 
-      if (cached) {
-        const ttl = await redis.ttl(cacheKey);
+  if (cached.status === "fresh") {
+    return analysisResponse(cached.value.value, {
+      cached: true,
+      stale: false,
+      updatedAt: cached.value.updatedAt,
+    });
+  }
 
-        return NextResponse.json({
-          ...cached,
-          cached: true,
-          expiresAt:
-            typeof ttl === "number" && ttl > 0
-              ? new Date(Date.now() + ttl * 1000).toISOString()
-              : null,
-        });
-      }
+  if (cached.status === "stale") {
+    const locked = await acquireFootballRefreshLock(lockKey, 60);
+
+    if (!locked) {
+      return analysisResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
     }
 
+    try {
+      const value = await buildAnalysis(request, field);
+
+      const saved = await writeFootballCache(
+        cacheKey,
+        value,
+        freshForMs,
+        staleForMs,
+      );
+
+      return analysisResponse(value, {
+        cached: false,
+        stale: false,
+        updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("AI analysis refresh failed; serving stale cache:", error);
+
+      return analysisResponse(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
+  }
+
+  const locked = await acquireFootballRefreshLock(lockKey, 60);
+
+  if (!locked) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const retryCache = await readFootballCache<AnalysisResponse>(cacheKey);
+
+    if (retryCache.status === "fresh" || retryCache.status === "stale") {
+      return analysisResponse(retryCache.value.value, {
+        cached: true,
+        stale: retryCache.status === "stale",
+        updatedAt: retryCache.value.updatedAt,
+      });
+    }
+
+    return NextResponse.json(
+      {
+        field,
+        items: [],
+        cached: true,
+        stale: true,
+        updatedAt: null,
+        message: "Analysis is being prepared. Please try again shortly.",
+      },
+      {
+        status: 202,
+        headers: {
+          "Retry-After": "2",
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
+
+  try {
     if (aiRateLimit) {
       const identifier = clientIp(request);
       const { success, reset } = await aiRateLimit.limit(identifier);
@@ -873,80 +1026,22 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const origin = request.nextUrl.origin;
+    const value = await buildAnalysis(request, field);
 
-    const [newsResponse, marketsResponse] = await Promise.all([
-      fetch(`${origin}/api/news/latest?field=${encodeURIComponent(field)}`, {
-        cache: "no-store",
-      }),
-      fetch(
-        `${origin}/api/markets/active?field=${encodeURIComponent(field)}&limit=25`,
-        { cache: "no-store" },
-      ),
-    ]);
+    const saved = await writeFootballCache(
+      cacheKey,
+      value,
+      freshForMs,
+      staleForMs,
+    );
 
-    if (!newsResponse.ok || !marketsResponse.ok) {
-      return NextResponse.json(
-        { error: "News or Limitless markets could not be loaded." },
-        { status: 502 },
-      );
-    }
-
-    const newsData = await newsResponse.json();
-    const marketData = await marketsResponse.json();
-
-    const headlines: Headline[] = Array.isArray(newsData.headlines)
-      ? newsData.headlines.slice(0, 8)
-      : [];
-
-    const markets: Market[] = Array.isArray(marketData.markets)
-      ? marketData.markets
-      : [];
-
-    if (headlines.length === 0) {
-      return NextResponse.json(
-        { error: "No live headlines are available." },
-        { status: 404 },
-      );
-    }
-
-    const prompt = buildPrompt(field, headlines, markets);
-    const model = await askModel(prompt);
-
-    let parsedAnalyses: ModelAnalysis[] = [];
-
-    if (model.text) {
-      try {
-        const parsed = JSON.parse(cleanJson(model.text)) as {
-          analyses?: unknown;
-        };
-
-        parsedAnalyses = Array.isArray(parsed.analyses)
-          ? (parsed.analyses as ModelAnalysis[])
-          : [];
-      } catch {
-        parsedAnalyses = [];
-      }
-    }
-
-    const value = {
-      field,
-      updatedAt: new Date().toISOString(),
-      provider: model.provider,
-      items: buildItems(headlines, markets, parsedAnalyses, field),
-    };
-
-    if (redis) {
-      await redis.set(cacheKey, value, { ex: ttlSeconds });
-    }
-
-    return NextResponse.json({
-      ...value,
+    return analysisResponse(value, {
       cached: false,
-      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      stale: false,
+      updatedAt: saved?.updatedAt ?? new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Analysis route error:", error);
+    console.error("AI analysis route error:", error);
 
     return NextResponse.json(
       {
@@ -957,5 +1052,7 @@ export async function GET(request: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    await releaseFootballRefreshLock(lockKey);
   }
 }

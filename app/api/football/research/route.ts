@@ -1,4 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,6 +56,7 @@ type FormSummary = {
   draws: number;
   losses: number;
   played: number;
+  available: boolean;
 };
 
 function apiFootballHeaders() {
@@ -80,10 +87,10 @@ async function apiFootballFetch<T>(path: string): Promise<T> {
     );
   }
 
-  if (body?.errors && Object.keys(body.errors).length > 0) {
+    if (body?.errors && Object.keys(body.errors).length > 0) {
+    console.error("API-Football response errors:", path, body.errors);
     throw new Error(JSON.stringify(body.errors));
   }
-
   return body as T;
 }
 
@@ -127,45 +134,64 @@ function summarizeForm(
     .filter((result): result is "W" | "D" | "L" => result !== null)
     .slice(0, 5);
 
-  return {
+    return {
     sequence,
     wins: sequence.filter((result) => result === "W").length,
     draws: sequence.filter((result) => result === "D").length,
     losses: sequence.filter((result) => result === "L").length,
     played: sequence.length,
+    available: true,
+  };
+}
+
+function unavailableForm(): FormSummary {
+  return {
+    sequence: [],
+    wins: 0,
+    draws: 0,
+    losses: 0,
+    played: 0,
+    available: false,
+  };
+}
+
+function unavailableWinRate() {
+  return {
+    played: 0,
+    wins: 0,
+    rate: null,
+    available: false,
   };
 }
 
 function calculateWinRate(
-  matches: ApiFootballResult[],
+  history: ApiFootballResult[],
   teamId: number,
   venue: "home" | "away",
-) {
-  const relevantMatches = matches.filter((match) =>
-    venue === "home"
-      ? match.teams.home.id === teamId
-      : match.teams.away.id === teamId,
+): {
+  played: number;
+  wins: number;
+  rate: number | null;
+  available: boolean;
+} {
+  const venueMatches = history.filter(
+    (match) => match.teams[venue]?.id === teamId,
   );
 
-  const completedMatches = relevantMatches.filter(
-    (match) =>
-      match.goals.home !== null &&
-      match.goals.away !== null &&
-      match.goals.home !== undefined &&
-      match.goals.away !== undefined,
-  );
+  const played = venueMatches.length;
+  const wins = venueMatches.filter((match) => {
+    const teamGoals = match.goals[venue] ?? 0;
+    const opponentGoals = match.goals[venue === "home" ? "away" : "home"] ?? 0;
+    return teamGoals > opponentGoals;
+  }).length;
 
-  const wins = completedMatches.filter(
-    (match) => resultForTeam(match, teamId) === "W",
-  ).length;
+  const rate = played > 0 ? wins / played : null;
 
   return {
-    played: completedMatches.length,
+    played,
     wins,
-    rate:
-      completedMatches.length > 0
-        ? Math.round((wins / completedMatches.length) * 100)
-        : null,
+    rate,
+    available: true,
   };
 }
 
@@ -177,18 +203,78 @@ function sortNewestFirst(matches: ApiFootballResult[]) {
 }
 
 export async function GET(request: NextRequest) {
-  try {
-    const fixtureId = Number(
-      request.nextUrl.searchParams.get("fixtureId") ?? "",
+  const fixtureId = Number(
+    request.nextUrl.searchParams.get("fixtureId") ?? "",
+  );
+
+  if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
+    return NextResponse.json(
+      { error: "A valid numeric fixtureId is required." },
+      { status: 400 },
+    );
+  }
+
+  const cacheKey = `limitless-radar:football:research:v1:${fixtureId}`;
+  const lockKey = `${cacheKey}:refresh-lock`;
+  const freshForMs = 60 * 60 * 1000;
+  const staleForMs = 48 * 60 * 60 * 1000;
+
+    type ResearchValue = {
+    fixtureId: number;
+    fixture: {
+      kickoff: string;
+      competition: string;
+      country: string | null;
+      season: number;
+      venue: string | null;
+      city: string | null;
+      homeTeam: ApiFootballTeam;
+      awayTeam: ApiFootballTeam;
+    };
+    home: {
+      team: ApiFootballTeam;
+      recentForm: FormSummary;
+      homeWinRate: {
+        played: number;
+        wins: number;
+        rate: number | null;
+        available: boolean;
+      };
+    };
+    away: {
+      team: ApiFootballTeam;
+      recentForm: FormSummary;
+      awayWinRate: {
+        played: number;
+        wins: number;
+        rate: number | null;
+        available: boolean;
+      };
+    };
+    sampleNote: string;
+  };
+
+  const send = (
+    value: ResearchValue,
+    options: {
+      cached: boolean;
+      stale: boolean;
+      updatedAt: string | null;
+    },
+  ) =>
+    NextResponse.json(
+      {
+        ...value,
+        ...options,
+      },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+        },
+      },
     );
 
-    if (!Number.isInteger(fixtureId) || fixtureId <= 0) {
-      return NextResponse.json(
-        { error: "A valid numeric fixtureId is required." },
-        { status: 400 },
-      );
-    }
-
+  const buildResearch = async (): Promise<ResearchValue> => {
     const fixtureData = await apiFootballFetch<{
       response: ApiFootballFixture[];
     }>(`/fixtures?id=${fixtureId}`);
@@ -196,10 +282,7 @@ export async function GET(request: NextRequest) {
     const fixture = fixtureData.response?.[0];
 
     if (!fixture) {
-      return NextResponse.json(
-        { error: "Football fixture not found." },
-        { status: 404 },
-      );
+      throw new Error("Football fixture not found.");
     }
 
     const season = fixture.league.season;
@@ -207,39 +290,52 @@ export async function GET(request: NextRequest) {
     const homeTeam = fixture.teams.home;
     const awayTeam = fixture.teams.away;
 
-    const [homeHistoryData, awayHistoryData] = await Promise.all([
-      apiFootballFetch<{ response: ApiFootballResult[] }>(
-        `/fixtures?team=${homeTeam.id}&league=${leagueId}&season=${season}&last=20`,
-      ),
-      apiFootballFetch<{ response: ApiFootballResult[] }>(
-        `/fixtures?team=${awayTeam.id}&league=${leagueId}&season=${season}&last=20`,
-      ),
-    ]);
+        let homeHistory: ApiFootballResult[] = [];
+    let awayHistory: ApiFootballResult[] = [];
+    let historyAvailable = true;
 
-    const homeHistory = sortNewestFirst(homeHistoryData.response ?? []).filter(
-      (match) => match.fixture.id !== fixtureId,
-    );
+    try {
+      const [homeHistoryData, awayHistoryData] = await Promise.all([
+        apiFootballFetch<{ response: ApiFootballResult[] }>(
+          `/fixtures?team=${homeTeam.id}&league=${leagueId}&season=${season}&last=20`,
+        ),
+        apiFootballFetch<{ response: ApiFootballResult[] }>(
+          `/fixtures?team=${awayTeam.id}&league=${leagueId}&season=${season}&last=20`,
+        ),
+      ]);
 
-    const awayHistory = sortNewestFirst(awayHistoryData.response ?? []).filter(
-      (match) => match.fixture.id !== fixtureId,
-    );
+      homeHistory = sortNewestFirst(homeHistoryData.response ?? []).filter(
+        (match) => match.fixture.id !== fixtureId,
+      );
 
-    const homeForm = summarizeForm(homeHistory, homeTeam.id);
-    const awayForm = summarizeForm(awayHistory, awayTeam.id);
+      awayHistory = sortNewestFirst(awayHistoryData.response ?? []).filter(
+        (match) => match.fixture.id !== fixtureId,
+      );
+    } catch (error) {
+      historyAvailable = false;
+      console.warn(
+        "Football history is unavailable for this fixture; returning fixture details only.",
+        error,
+      );
+    }
 
-    const homeVenueRate = calculateWinRate(
-      homeHistory,
-      homeTeam.id,
-      "home",
-    );
+    const homeForm = historyAvailable
+      ? summarizeForm(homeHistory, homeTeam.id)
+      : unavailableForm();
 
-    const awayVenueRate = calculateWinRate(
-      awayHistory,
-      awayTeam.id,
-      "away",
-    );
+    const awayForm = historyAvailable
+      ? summarizeForm(awayHistory, awayTeam.id)
+      : unavailableForm();
 
-    return NextResponse.json({
+    const homeVenueRate = historyAvailable
+      ? calculateWinRate(homeHistory, homeTeam.id, "home")
+      : unavailableWinRate();
+
+    const awayVenueRate = historyAvailable
+      ? calculateWinRate(awayHistory, awayTeam.id, "away")
+      : unavailableWinRate();
+
+    return {
       fixtureId,
       fixture: {
         kickoff: fixture.fixture.date,
@@ -261,19 +357,116 @@ export async function GET(request: NextRequest) {
         recentForm: awayForm,
         awayWinRate: awayVenueRate,
       },
-      sampleNote:
-        "Form and venue win rates use completed league fixtures from the current season, excluding the selected fixture.",
-      updatedAt: new Date().toISOString(),
+            sampleNote: historyAvailable
+        ? "Form and venue win rates use completed league fixtures from the current season, excluding the selected fixture."
+        : "Current-season form data is unavailable on the configured football API plan. Fixture details are still shown.",
+    };
+  };
+
+  const cached = await readFootballCache<ResearchValue>(cacheKey);
+
+  if (cached.status === "fresh") {
+    return send(cached.value.value, {
+      cached: true,
+      stale: false,
+      updatedAt: cached.value.updatedAt,
     });
-  } catch (error) {
+  }
+
+  if (cached.status === "stale") {
+    const locked = await acquireFootballRefreshLock(lockKey);
+
+    if (!locked) {
+      return send(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    }
+
+    try {
+      const value = await buildResearch();
+      const saved = await writeFootballCache(
+        cacheKey,
+        value,
+        freshForMs,
+        staleForMs,
+      );
+
+      return send(value, {
+        cached: false,
+        stale: false,
+        updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("Football research refresh failed; serving stale cache:", error);
+
+      return send(cached.value.value, {
+        cached: true,
+        stale: true,
+        updatedAt: cached.value.updatedAt,
+      });
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
+  }
+
+  const locked = await acquireFootballRefreshLock(lockKey);
+
+  if (!locked) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const retryCache = await readFootballCache<ResearchValue>(cacheKey);
+
+    if (retryCache.status === "fresh" || retryCache.status === "stale") {
+      return send(retryCache.value.value, {
+        cached: true,
+        stale: retryCache.status === "stale",
+        updatedAt: retryCache.value.updatedAt,
+      });
+    }
+
     return NextResponse.json(
       {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to load football research.",
+        fixtureId,
+        cached: true,
+        stale: true,
+        updatedAt: null,
+        message: "Football research is being prepared. Please check back shortly.",
       },
-      { status: 500 },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
     );
+  }
+
+  try {
+    const value = await buildResearch();
+    const saved = await writeFootballCache(
+      cacheKey,
+      value,
+      freshForMs,
+      staleForMs,
+    );
+
+    return send(value, {
+      cached: false,
+      stale: false,
+      updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Football research route error:", error);
+
+    return NextResponse.json(
+      {
+        fixtureId,
+        error: "Football research is temporarily unavailable. Please try again later.",
+      },
+      { status: 503 },
+    );
+  } finally {
+    await releaseFootballRefreshLock(lockKey);
   }
 }
