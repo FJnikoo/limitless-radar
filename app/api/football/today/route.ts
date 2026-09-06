@@ -1,4 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  acquireFootballRefreshLock,
+  readFootballCache,
+  releaseFootballRefreshLock,
+  writeFootballCache,
+} from "@/lib/football-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -66,10 +72,6 @@ type TodayGame = {
   marketVolumeFormatted: string;
 };
 
-type CachedValue<T> = {
-  value: T;
-  expiresAt: number;
-};
 
 const ALLOWED_LEAGUES = new Set([
   39, // Premier League
@@ -135,11 +137,7 @@ const TEAM_ALIASES: Record<string, string[]> = {
   almeria: ["almeria", "union deportiva almeria"],
 };
 
-const fixturesCache = new Map<string, CachedValue<FootballFixture[]>>();
-let marketsCache: CachedValue<LimitlessMarket[]> | null = null;
 
-const FIXTURES_CACHE_MS = 2 * 60 * 1000;
-const MARKETS_CACHE_MS = 2 * 60 * 1000;
 const MARKET_PAGE_COUNT = 20;
 const MARKET_PAGE_SIZE = 25;
 
@@ -313,38 +311,11 @@ function isFootballMarket(market: LimitlessMarket) {
   );
 }
 
-function getCachedFixtures(date: string) {
-  const cached = fixturesCache.get(date);
 
-  return cached && cached.expiresAt > Date.now() ? cached.value : null;
-}
 
-function getCachedMarkets() {
-  return marketsCache && marketsCache.expiresAt > Date.now()
-    ? marketsCache.value
-    : null;
-}
-
-function removeExpiredCache() {
-  const now = Date.now();
-
-  for (const [date, cached] of fixturesCache) {
-    if (cached.expiresAt <= now) {
-      fixturesCache.delete(date);
-    }
-  }
-
-  if (marketsCache && marketsCache.expiresAt <= now) {
-    marketsCache = null;
-  }
-}
 
 async function fetchApiFootballToday(date: string) {
-  const cached = getCachedFixtures(date);
 
-  if (cached) {
-    return cached;
-  }
 
   const key = process.env.API_FOOTBALL_KEY;
 
@@ -376,20 +347,13 @@ async function fetchApiFootballToday(date: string) {
     ? (data.response as FootballFixture[])
     : [];
 
-  fixturesCache.set(date, {
-    value: fixtures,
-    expiresAt: Date.now() + FIXTURES_CACHE_MS,
-  });
+
 
   return fixtures;
 }
 
 async function fetchLimitlessSportsMarkets() {
-  const cached = getCachedMarkets();
 
-  if (cached) {
-    return cached;
-  }
 
   const requests = Array.from({ length: MARKET_PAGE_COUNT }, (_, index) =>
     fetch(
@@ -433,10 +397,7 @@ async function fetchLimitlessSportsMarkets() {
 
   const markets = [...unique.values()].filter(isFootballMarket);
 
-  marketsCache = {
-    value: markets,
-    expiresAt: Date.now() + MARKETS_CACHE_MS,
-  };
+
 
   return markets;
 }
@@ -535,18 +496,193 @@ export async function GET(request: NextRequest) {
       ? requestedDate
       : getUtcDate();
 
-  try {
-    removeExpiredCache();
+  const cacheKey = `limitless-radar:football:today:v1:${date}`;
+  const lockKey = `${cacheKey}:refresh-lock`;
+  const freshForMs = 15 * 60 * 1000;
+  const staleForMs = 48 * 60 * 60 * 1000;
 
+  const cached = await readFootballCache<{
+    date: string;
+    timezone: string;
+    leagues: string[];
+    games: TodayGame[];
+  }>(cacheKey);
+
+  if (cached.status === "fresh") {
+    return NextResponse.json(
+      {
+        ...cached.value.value,
+        cached: true,
+        stale: false,
+        updatedAt: cached.value.updatedAt,
+      },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+        },
+      },
+    );
+  }
+
+  if (cached.status === "stale") {
+    const locked = await acquireFootballRefreshLock(lockKey);
+
+    if (!locked) {
+      return NextResponse.json(
+        {
+          ...cached.value.value,
+          cached: true,
+          stale: true,
+          updatedAt: cached.value.updatedAt,
+        },
+        {
+          headers: {
+            "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+          },
+        },
+      );
+    }
+
+    try {
+      const [fixtures, limitlessMarkets] = await Promise.all([
+        fetchApiFootballToday(date),
+        fetchLimitlessSportsMarkets(),
+      ]);
+
+      const games = fixtures
+        .filter((fixture) => ALLOWED_LEAGUES.has(fixture.league?.id ?? -1))
+        .filter(fixtureIsVisible)
+        .map((fixture) => buildTodayGame(fixture, limitlessMarkets))
+        .filter((game): game is TodayGame => game !== null)
+        .sort((a, b) => {
+          if (b.marketVolume !== a.marketVolume) {
+            return b.marketVolume - a.marketVolume;
+          }
+
+          return new Date(a.kickoff).getTime() - new Date(b.kickoff).getTime();
+        })
+        .slice(0, 5);
+
+      const value = {
+        date,
+        timezone: "UTC",
+        leagues: [
+          "Premier League",
+          "EFL Championship",
+          "League One",
+          "League Two",
+          "FA Cup",
+          "Carabao Cup",
+          "La Liga",
+          "Serie A",
+          "Serie B",
+          "Coppa Italia",
+          "Primeira Liga",
+          "UEFA Champions League",
+          "UEFA Europa League",
+          "UEFA Conference League",
+        ],
+        games,
+      };
+
+      const saved = await writeFootballCache(
+        cacheKey,
+        value,
+        freshForMs,
+        staleForMs,
+      );
+
+      return NextResponse.json(
+        {
+          ...value,
+          cached: false,
+          stale: false,
+          updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+        },
+        {
+          headers: {
+            "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+          },
+        },
+      );
+    } catch (error) {
+      console.error("Football today refresh failed; serving stale cache:", error);
+
+      return NextResponse.json(
+        {
+          ...cached.value.value,
+          cached: true,
+          stale: true,
+          updatedAt: cached.value.updatedAt,
+        },
+        {
+          headers: {
+            "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+          },
+        },
+      );
+    } finally {
+      await releaseFootballRefreshLock(lockKey);
+    }
+  }
+
+  const locked = await acquireFootballRefreshLock(lockKey);
+
+    if (!locked) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const retryCache = await readFootballCache<{
+      date: string;
+      timezone: string;
+      leagues: string[];
+      games: TodayGame[];
+    }>(cacheKey);
+
+    if (retryCache.status === "fresh" || retryCache.status === "stale") {
+      return NextResponse.json(
+        {
+          ...retryCache.value.value,
+          cached: true,
+          stale: retryCache.status === "stale",
+          updatedAt: retryCache.value.updatedAt,
+        },
+        {
+          headers: {
+            "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+          },
+        },
+      );
+    }
+
+    return NextResponse.json(
+      {
+        date,
+        timezone: "UTC",
+        leagues: [],
+        games: [],
+        cached: true,
+        stale: true,
+        updatedAt: null,
+        message: "Football data is being prepared. Please check back shortly.",
+      },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
+
+  try {
     const [fixtures, limitlessMarkets] = await Promise.all([
       fetchApiFootballToday(date),
       fetchLimitlessSportsMarkets(),
     ]);
 
     const games = fixtures
-  .filter((fixture) => ALLOWED_LEAGUES.has(fixture.league?.id ?? -1))
-  .filter(fixtureIsVisible)
-  .map((fixture) => buildTodayGame(fixture, limitlessMarkets))
+      .filter((fixture) => ALLOWED_LEAGUES.has(fixture.league?.id ?? -1))
+      .filter(fixtureIsVisible)
+      .map((fixture) => buildTodayGame(fixture, limitlessMarkets))
       .filter((game): game is TodayGame => game !== null)
       .sort((a, b) => {
         if (b.marketVolume !== a.marketVolume) {
@@ -557,7 +693,7 @@ export async function GET(request: NextRequest) {
       })
       .slice(0, 5);
 
-    return NextResponse.json({
+    const value = {
       date,
       timezone: "UTC",
       leagues: [
@@ -577,18 +713,39 @@ export async function GET(request: NextRequest) {
         "UEFA Conference League",
       ],
       games,
-    });
+    };
+
+    const saved = await writeFootballCache(
+      cacheKey,
+      value,
+      freshForMs,
+      staleForMs,
+    );
+
+    return NextResponse.json(
+      {
+        ...value,
+        cached: false,
+        stale: false,
+        updatedAt: saved?.updatedAt ?? new Date().toISOString(),
+      },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+        },
+      },
+    );
   } catch (error) {
     console.error("Football today route error:", error);
 
     return NextResponse.json(
       {
         error:
-          error instanceof Error
-            ? error.message
-            : "Unable to load today's football fixtures.",
+          "Football data is temporarily unavailable. Please try again later.",
       },
-      { status: 500 },
+      { status: 503 },
     );
+  } finally {
+    await releaseFootballRefreshLock(lockKey);
   }
 }
