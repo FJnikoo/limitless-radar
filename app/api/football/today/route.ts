@@ -216,9 +216,32 @@ function titleHasBothTeams(
     return false;
   }
 
+  
+
   return (
     titleHasTeamAlias(marketTitle, homeTeam) &&
     titleHasTeamAlias(marketTitle, awayTeam)
+  );
+}
+
+function isSideMarketTitle(title: string) {
+  const text = normaliseText(title);
+
+  return /both teams? (to )?score|btts|over \d|under \d|total goals?|first team to score|last team to score|correct score|half time|halftime|first half|second half|corners?|cards?|bookings?|offsides?|shots?|score in both halves|clean sheet|double chance|draw no bet|handicap/i.test(
+    text,
+  );
+}
+
+function isLikelyMainMatchMarket(
+  market: LimitlessMarket,
+  homeTeam: string,
+  awayTeam: string,
+) {
+  const title = market.title ?? "";
+
+  return (
+    titleHasBothTeams(title, homeTeam, awayTeam) &&
+    !isSideMarketTitle(title)
   );
 }
 
@@ -447,19 +470,19 @@ function buildTodayGame(
     return null;
   }
 
-  const matchingMarkets = markets.filter((market) =>
-    titleHasBothTeams(market.title ?? "", homeTeam, awayTeam),
-  );
+  const mainMatchMarkets = markets.filter((market) =>
+  isLikelyMainMatchMarket(market, homeTeam, awayTeam),
+);
 
-  if (matchingMarkets.length === 0) {
-    return null;
-  }
+if (mainMatchMarkets.length === 0) {
+  return null;
+}
 
-  const bestMarket = [...matchingMarkets].sort(
-    (a, b) =>
-      volumeNumber(b.volume ?? b.volumeFormatted) -
-      volumeNumber(a.volume ?? a.volumeFormatted),
-  )[0];
+const bestMarket = [...mainMatchMarkets].sort(
+  (a, b) =>
+    volumeNumber(b.volume ?? b.volumeFormatted) -
+    volumeNumber(a.volume ?? a.volumeFormatted),
+)[0];
 
   const venueName = fixture.fixture?.venue?.name?.trim() ?? "";
   const venueCity = fixture.fixture?.venue?.city?.trim() ?? "";
@@ -496,7 +519,7 @@ export async function GET(request: NextRequest) {
       ? requestedDate
       : getUtcDate();
 
-  const cacheKey = `limitless-radar:football:today:v1:${date}`;
+  const cacheKey = `limitless-radar:football:today:v2:${date}`;
   const lockKey = `${cacheKey}:refresh-lock`;
   const freshForMs = 15 * 60 * 1000;
   const staleForMs = 48 * 60 * 60 * 1000;
