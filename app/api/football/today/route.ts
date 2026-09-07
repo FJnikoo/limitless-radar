@@ -238,11 +238,15 @@ function isLikelyMainMatchMarket(
   awayTeam: string,
 ) {
   const title = market.title ?? "";
+  const slug = normaliseText(market.slug ?? "");
+  const text = `${normaliseText(title)} ${slug}`;
 
-  return (
-    titleHasBothTeams(title, homeTeam, awayTeam) &&
-    !isSideMarketTitle(title)
-  );
+  const isSideMarket =
+    /both teams? (to )?score|both to score|btts|over \d|under \d|total goals?|first team to score|last team to score|correct score|half time|halftime|first half|second half|corners?|cards?|bookings?|offsides?|shots?|score in both halves|clean sheet|double chance|draw no bet|handicap/i.test(
+      text,
+    );
+
+  return titleHasBothTeams(title, homeTeam, awayTeam) && !isSideMarket;
 }
 
 function volumeNumber(value: unknown) {
@@ -519,7 +523,7 @@ export async function GET(request: NextRequest) {
       ? requestedDate
       : getUtcDate();
 
-  const cacheKey = `limitless-radar:football:today:v2:${date}`;
+  const cacheKey = `limitless-radar:football:today:v3:${date}`;
   const lockKey = `${cacheKey}:refresh-lock`;
   const freshForMs = 15 * 60 * 1000;
   const staleForMs = 48 * 60 * 60 * 1000;
